@@ -1,0 +1,255 @@
+import requests
+import json
+import datetime
+import time
+import threading
+import sys
+
+
+def printPrettyJSON(txt):
+    try:
+        if type(txt) == str:
+            print(json.dumps(json.loads(txt), ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps(txt, ensure_ascii=False, indent=2))
+    except:
+        print(txt)
+
+
+def timestamp2human(ts, format='%Y-%m-%d %H:%M:%S'):
+    if ts > 2**31 - 1:
+        ts /= 1000
+    return datetime.datetime.fromtimestamp(ts).strftime(format)
+
+
+def log(txt):
+    with open('allcpp.log', 'a', encoding='utf-8') as f:
+        f.write(f'[{datetime.datetime.now()}]\n')
+        try:
+            f.write(json.dumps(json.loads(txt), ensure_ascii=False, indent=2) + '\n')
+        except:
+            f.write(txt + '\n')
+
+
+def loadCfg():
+    defaultCfg = {
+        'deviceId': '0123456789abcdef',
+        'deviceSpec': 'allcpp',
+        'activePurchaser': -1,
+        'token': '',
+    }
+    try:
+        with open('config.json') as f:
+            cfg = json.load(f)
+            for key in defaultCfg:
+                if not key in cfg:
+                    cfg[key] = defaultCfg[key]
+            return cfg
+    except:
+        return defaultCfg
+
+
+def saveCfg(cfg):
+    with open('config.json', 'w') as f:
+        json.dump(cfg, f, indent=2)
+
+
+def login(account, password):
+    r = requests.post('https://user.allcpp.cn/api/login/normal', {
+        'account': account,
+        'password': password,
+    })
+    log(r.text)
+    try:
+        return json.loads(r.text)['token']
+    except:
+        return False
+
+
+# check token using getPurchaserList API
+def testToken(token):
+    r = requests.get('https://www.allcpp.cn/allcpp/user/purchaser/getList.do', params={'token': token})
+    log(r.text)
+    try:
+        return type(json.loads(r.text)) == list
+    except:
+        return False
+
+
+def getPurchasers():
+    r = session.get('https://www.allcpp.cn/allcpp/user/purchaser/getList.do')
+    log(r.text)
+    return r.text
+
+
+def getEvents():
+    r = session.post('https://www.allcpp.cn/api/event/getEventMainList.do', params={
+        'isonline': -1,
+        'cityid': 0,
+        'isnew': 1,
+        'orderbyid': 1,
+        'typeid': 0,
+        'pageSize': 20,
+        'pageindex': 1,
+    })
+    log(r.text)
+    return r.text
+
+
+def getTickets(eventMainId, ticketMainId=0):
+    r = session.get('https://www.allcpp.cn/allcpp/ticket/getTicketTypeList.do', params={
+        'eventMainId': eventMainId,
+        'ticketMainId': ticketMainId,
+    })
+    log(r.text)
+    return r.text
+
+
+def buyTicket(ticketTypeId, purchaserIds, count=1):
+    r = session.post('https://www.allcpp.cn/api/ticket/buyticket.do', params={
+        'ticketTypeId': ticketTypeId,
+        'purchaserIds': purchaserIds,
+        'count': count,
+    })
+    log(r.text)
+    return r.text
+
+
+def buyTicket_Repeat(ticketTypeId, purchaserIds, count=1):
+    retryCount = 0
+    while not stopBuyingTickets.is_set():
+        print(f'\n【正在购票（ID：{ticketTypeId}，购票人：{purchaserIds}）x {count} | retry {retryCount} …】')
+        r = ''
+        r = buyTicket(ticketTypeId, purchaserIds, count)
+        printPrettyJSON(r)
+        try:
+            if json.loads(r)['isSuccess'] == True:
+                print('【购票成功！】')
+                break
+        except:
+            pass
+        print('【购票失败！正在重试…】')
+        retryCount += 1
+        stopBuyingTickets.wait(1.5)
+
+
+def buyAllTicketsByEventId(id, purchaserIds=None, buy=True, exclude=None):
+    if purchaserIds == None:
+        purchaserIds = activePurchaser
+    tickets = json.loads(getTickets(id))
+    print(f'\n【展会名称：{tickets['ticketMain']['eventName']} (ID：{tickets['ticketMain']['eventMainId']})】')
+
+    if len(tickets['ticketTypeList']) == 0:
+        print('\n暂无票种！')
+
+    for ticket in tickets['ticketTypeList']:
+        print(f'\n【票名：{ticket['ticketName']} (ID：{ticket['id']})】')
+        print(f'开票时间：{timestamp2human(ticket['sellStartTime'])}')
+        print(f'剩余票数：{ticket['remainderNum']}')
+
+        if buy == False or (exclude and exclude in ticket['ticketName']):
+            print('【跳过购票】')
+            continue
+
+        # create a new thread to buy ticket repeatedly until success
+        global stopBuyingTickets
+        stopBuyingTickets.clear()
+        threading.Thread(target=buyTicket_Repeat, args=[ticket['id'], purchaserIds], name=f'buyTicketThread-{ticket['id']}').start()
+        # time.sleep(0.1)
+
+
+def waitForTicketOpenBuy(id):
+    while True:
+        tickets = json.loads(getTickets(id))
+        print(f'\n【{tickets['ticketMain']['eventName']} (ID：{tickets['ticketMain']['eventMainId']})】')
+        for ticket in tickets['ticketTypeList']:
+            print(f'[{ticket['id']}] {ticket['ticketName']} \t开票时间：{timestamp2human(ticket['sellStartTime'])} \t距开票：{ticket['openTimer'] / 1000}s')
+            if not ticket['openTimer'] > 0:
+                return
+        time.sleep(1 if ticket['openTimer'] < 20 else 5)
+
+
+# load config
+cfg = loadCfg()
+
+# test token
+if not testToken(cfg['token']):
+    print('请登录！')
+    while True:
+        username = input('用户名：')
+        password = input('密码：')
+        token = login(username, password)
+        if token:
+            print('登录成功！')
+            cfg['token'] = token
+            break
+        else:
+            print('登录失败，请重试！')
+else:
+    print('Token有效，无需重新登录')
+
+saveCfg(cfg)
+
+
+# create http session
+session = requests.session()
+# set common params
+session.params = {
+    'appVersion': '3.13.6',
+    'deviceVersion': '33',
+    'bid': 'cn.comicup.apps.cppub',
+    'deviceId': cfg['deviceId'],
+    'equipmentType': '1',
+    'deviceSpec': cfg['deviceSpec'],
+    'token': cfg['token'],
+}
+
+print('当前公共请求头：')
+printPrettyJSON(session.params)
+
+
+# get account purchasers
+purchaserList = json.loads(getPurchasers())
+
+print('\n购票人列表：')
+for i in range(len(purchaserList)):
+    print(f'{i}. {purchaserList[i]['realname']} {purchaserList[i]['idcard']} {purchaserList[i]['mobile']} (ID：{purchaserList[i]['id']})')
+
+# select purchaser from config
+for purchaserObj in purchaserList:
+    if purchaserObj['id'] == cfg['activePurchaser']:
+        activePurchaser = cfg['activePurchaser']
+        break
+try:
+    activePurchaser
+    print(f'\n【已选择购票人ID：{activePurchaser}】\n')
+# if failed, select purchaser manually
+except:
+    activePurchaser = purchaserList[int(input('\n请选择购票人（填序号）：'))]['id']
+    print(f'已选择购票人ID：{activePurchaser}\n')
+
+
+stopBuyingTickets = threading.Event()
+
+
+if __name__ == '__main__':
+
+    # waitForTicketOpenBuy(2527)
+    waitForTicketOpenBuy(2319)
+    buyAllTicketsByEventId(2319, buy=True, exclude='VIP')
+
+    # check if all threads are stopped before exit
+    try:
+        while True:
+            hasTicketsBuying = False
+            for thread in threading.enumerate():
+                if thread.name.startswith('buyTicketThread'):
+                    hasTicketsBuying = True
+                    break
+            if not hasTicketsBuying:
+                break
+            time.sleep(0.1)
+    # handle ctrl-c to quit
+    except KeyboardInterrupt:
+        print('\n** Stopping buying threads...')
+        stopBuyingTickets.set()
